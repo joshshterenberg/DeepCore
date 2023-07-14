@@ -12,6 +12,8 @@ from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import nn
 ##import pdb ## for debug stuff
 
+#import tensorflow_model_optimization as tfmot
+
 ##
 keras = tf.keras
 ##import keras
@@ -21,17 +23,29 @@ import tensorflow.keras.backend as K
 
 from keras.callbacks import Callback
 from keras.models import Model,load_model, Sequential
-from keras.layers import Input, LSTM, Dense, Flatten, Conv2D, MaxPooling2D, Dropout, Reshape, Conv2DTranspose, concatenate, Concatenate, ZeroPadding2D, UpSampling2D, UpSampling1D
+from keras.layers import Input, LSTM, Dense, Flatten, Conv2D, MaxPooling2D, Dropout, Reshape, Conv2DTranspose, concatenate, Concatenate, ZeroPadding2D, UpSampling2D, UpSampling1D, BatchNormalization
 from keras.optimizers import *
 from keras.initializers import *
 from keras.callbacks import ModelCheckpoint
+
+##JS_EDIT comment to disable mixed precision training
+#print("MP ACTIVE")
+#tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
+##JS_EDIT see below in model definition
+#print("BN ACTIVE")
+#BN_active = False
+
+##JS_EDIT comment to disable accelerated linear algebra (tf XLA api)
+#print("XLA ACTIVE")
+#tf.config.optimizer.set_jit(True)
 
 import pandas as pd
 import numpy as np
 from numpy import concatenate as concatenatenp
 
 import math
-import sys
+import os, sys
 import argparse
 import matplotlib as mpl
 mpl.use('Agg')
@@ -39,11 +53,13 @@ import matplotlib.backends.backend_pdf as backpdf
 from  matplotlib import pyplot as plt
 import pylab
 import glob
+import timeit
 
 import uproot3
 import uproot
 gpus = tf.config.experimental.list_physical_devices('GPU')
-tf.config.experimental.set_memory_growth(gpus[0], True)
+for gpu in gpus:
+    tf.config.experimental.set_memory_growth(gpu, True)
 
 #################################################################################################################################################################################################################################################################################
 ##
@@ -87,6 +103,13 @@ parser.add_argument('--epochsstart',                  dest='EpochsStart',    act
 ## passing csv file which contains loss plots values from past trainings so the loss plots can include all epochs, not just the ones from this training
 parser.add_argument('--csv',                          dest='Csv',            action='store',                     default='',  type=str,   help='name of the csv file')
 
+###JS_EDIT###
+parser.add_argument('--mp', dest='Mp', action='store_const', const=True, default=False, help='activate mixed-precision in training')
+parser.add_argument('--bn', dest='Bn', action='store_const', const=True, default=False, help='activate batch normalization in training')
+parser.add_argument('--xla', dest='Xla', action='store_const', const=True, default=False, help='activate accelerated linalg in training')
+#############
+
+
 args = parser.parse_args()
 
 OUTPUT = args.Output
@@ -108,9 +131,21 @@ EPOCHS_USED = args.Epochs
 WEIGHTS_CONTINUE = args.Weights
 EPOCHS_CONTINUE =args.EpochsStart
 CSV_LOAD = args.Csv
+
+##JS_EDIT
+MP = args.Mp
+BN = args.Bn
+XLA = args.Xla
+
 #------------------------------------------------------------------------------------------#
 #----------------------------- INTERNAL CONFIGURATION PARAMETERS --------------------------#
 #------------------------------------------------------------------------------------------#
+
+###JS_EDIT###
+if MP: tf.keras.mixed_precision.set_global_policy('mixed_float16')
+BN_active = True if BN else False
+if XLA: tf.config.optimizer.set_jit(True)
+#############
 
 if input_name != '' :
     LOCAL_INPUT = True   #use the local input, "input_name"
@@ -122,7 +157,7 @@ jetNum=0# number of jets in the input. will be filled with local input informati
 jetNum_validation = 0# number of jets in the input. will be filled with local input information
 jetDim=30 #dimension of window on the pixed detector layer (cannot be changed without chaning the training sample)
 overlapNum =3 #numer of overlap considered (cannot be changed without chaning the training sample)
-layNum = 4 ## 4 for barrel, for endcap use layNum = 7 #4 barrel+3 endcap. the numeration is 1-4 for barrel, 5-7 for endcap (cannot be changed without chaning the training sample).
+layNum = 7 ## 4 for barrel, for endcap use layNum = 7 #4 barrel+3 endcap. the numeration is 1-4 for barrel, 5-7 for endcap (cannot be changed without chaning the training sample). ###JS_EDIT was 4
 parNum=5 #number of track parameters (cannot be changed without chaning the training sample)
 _Epsilon = 1e-7 #value needed for the loss functione valuation
 inputModuleName= "DeepCoreNtuplizerTest" ## demo" ##"DeepCoreNtuplizerTest"
@@ -341,12 +376,8 @@ def loss_mse_select_clipped(y_true, y_pred) :
     wei = y_true[:,:,:,:,-1:]
     pred = y_pred[:,:,:,:,:-1]
     true =  y_true[:,:,:,:,:-1]
-    inv_sd = tf.constant([1/0.404, 1/0.478, 1/1.9, 1/2, 1/150], dtype=tf.float32) # inverse standard deviation of each TP
-    mean = tf.constant([0, 0, 0, 0, 95], dtype=tf.float32) # mean of each TP
-   # Standardization of target and predicted TPs
-    pred = tf.subtract(pred, mean)* inv_sd
-    true = tf.subtract(true,mean)*inv_sd
-    out =K.square(tf.clip_by_value(pred-true,-5,5))*wei  # Clipping at +/-5 sigmas
+    out =K.square(tf.clip_by_value(pred-true,-5,5))*wei 
+    # Clipping at 5 since all our param should be in the [-5, 5] range 
     return tf.reduce_sum(out, axis=None)/(tf.reduce_sum(wei,axis=None)*5+0.00001) #5=parNum
 
 # Generator used to load all the input file in the LOCAL_INPUT=False workflow
@@ -394,10 +425,6 @@ def Generator2(filepath,batch_size=0,count=False):
                     target_prob = np.reshape(chunk["trackProb"], (nev,jetDim,jetDim,overlapNum,1))
 
                     target_prob = concatenatenp([target_prob,chunk["trackPar"][:,:,:,:,-1:]],axis=4)
-                    #zero_elements = target_prob[:,:,:,:,-1]==0 #build an array that's True for every 0-valued entry
-                    #target_prob[:,:,:,:,-1]=1.0/target_prob[:,:,:,:,-1] #invert everything, which will send all 0 pt entries to inf
-                    #target_prob[:,:,:,:,-1][zero_elements] = 0 #reassign the inf values back to 0
-                    
                     ## debug
                     ##pdb.set_trace()
                     yield [chunk['cluster_measured'][:,:,:,0:layNum],chunk["jet_eta"],chunk["jet_pt"]],[chunk["trackPar"],target_prob]
@@ -558,7 +585,57 @@ def check_sample(files_input,files_input_validation) :
             
 
 
+###JS_EDIT implementing custom AdamW optimizer because tensorflow is weird
+import tensorflow as tf
 
+class AdamWOptimizer(tf.keras.optimizers.Optimizer):
+    def __init__(self, learning_rate=0.001, weight_decay=0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-7, name="AdamWOptimizer", **kwargs):
+        super(AdamWOptimizer, self).__init__(name, **kwargs)
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.beta_1 = beta_1
+        self.beta_2 = beta_2
+        self.epsilon = epsilon
+
+    def _create_slots(self, var_list):
+        for var in var_list:
+            self.add_slot(var, 'm')
+            self.add_slot(var, 'v')
+
+    def _resource_apply_dense(self, grad, var):
+        var_dtype = var.dtype.base_dtype
+        lr_t = self.learning_rate
+        wd_t = self.weight_decay
+        beta_1_t = self.beta_1
+        beta_2_t = self.beta_2
+        epsilon_t = self.epsilon
+
+        m = self.get_slot(var, "m")
+        v = self.get_slot(var, "v")
+
+        m_t = m.assign(beta_1_t * m + (1.0 - beta_1_t) * grad)
+        v_t = v.assign(beta_2_t * v + (1.0 - beta_2_t) * tf.square(grad))
+        m_hat = m_t / (1.0 - beta_1_t)
+        v_hat = v_t / (1.0 - beta_2_t)
+        
+        weight_decayed = var - wd_t * var
+        var_t = var.assign(weight_decayed - lr_t * m_hat / (tf.sqrt(v_hat) + epsilon_t))
+
+        return tf.group(var_t, m_t, v_t)
+
+    def _resource_apply_sparse(self, grad, var, indices):
+        raise NotImplementedError("Sparse gradient updates are not supported.")
+
+    def get_config(self):
+        config = {
+            'learning_rate': self.learning_rate,
+            'weight_decay': self.weight_decay,
+            'beta_1': self.beta_1,
+            'beta_2': self.beta_2,
+            'epsilon': self.epsilon
+        }
+        base_config = super(AdamWOptimizer, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
 
 
 
@@ -571,7 +648,7 @@ def check_sample(files_input,files_input_validation) :
 if(LOCAL_INPUT) : #loaded the local input
     print("WARNING: using local data (also for training!)")
     print("loading data: start")
-
+    import uproot3
     tfile = uproot3.open(input_name)
     tree = tfile[inputModuleName][inputTreeName]
     tree = tfile[inputModuleName][inputTreeName]
@@ -598,8 +675,9 @@ else :  #loaded the central input
     #files=glob.glob('/storage/local/data1/gpuscratch/hichemb/Training0217/TrainingSamples/training/DeepCoreTrainingSample*.root')
     #files_validation=glob.glob('/storage/local/data1/gpuscratch/hichemb/Training0217/TrainingSamples/validation/DeepCoreTrainingSample*.root')
     #Generator2 approach
-    trainingpath = "/storage/local/data1/gpuscratch/hichemb/DeepCore_git/DeepCore_Training/TrainingSamples/training/DeepCoreTrainingSample_*.root"
-    validationpath = "/storage/local/data1/gpuscratch/hichemb/DeepCore_git/DeepCore_Training/TrainingSamples/validation/DeepCoreTrainingSample_*.root"
+    #trainingpath = "/storage/local/data1/gpuscratch/hichemb/DeepCore_git/DeepCore_Training/TrainingSamples/training/DeepCoreTrainingSample_*.root" ###JS_EDIT uncomment
+    trainingpath = "/eos/user/n/nihaubri/DeepCore_data/DeepCore_Training/TrainingSamples/training/DeepCoreTrainingSample_300.root" ###JS_EDIT comment
+    validationpath = "/eos/user/n/nihaubri/DeepCore_data/DeepCore_Training/TrainingSamples/validation/DeepCoreTrainingSample_207.root"
     
     #GPU3 training/validation files
     #trainingpath = "/storage/local/data1/gpuscratch/njh/Training0217/training/DeepCoreTrainingSample_*.root:DeepCoreNtuplizerTest/DeepCoreNtuplizerTree;"
@@ -693,63 +771,52 @@ if TRAIN or PREDICT :
 #    reshaped_prob = Reshape((jetDim,jetDim,overlapNum,2))(conv1_3_1)
 #############################################################################################################################
 
- # DeepCore 2.0/2.1 Architecture
-#    conv30_9 = Conv2D(50,7, data_format="channels_last", input_shape=(jetDim,jetDim,layNum+2), activation='relu',padding="same")(ComplInput)
-#    conv30_7 = Conv2D(40,5, data_format="channels_last", activation='relu',padding="same")(conv30_9)
-#    conv30_5 = Conv2D(40,5, data_format="channels_last", activation='relu',padding="same")(conv30_7)#
-#    conv20_5 = Conv2D(30,5, data_format="channels_last", activation='relu',padding="same")(conv30_5)
-#    conv15_5 = Conv2D(30,3, data_format="channels_last", activation='relu',padding="same")(conv20_5)
+ # T1017 and T1024 Architecture
 
-#    conv15_3_1 = Conv2D(30,3, data_format="channels_last",activation='relu', padding="same")(conv15_5)
-#    conv15_3_2 = Conv2D(30,3, data_format="channels_last",activation='relu', padding="same")(conv15_3_1)
-#    conv15_3_3 = Conv2D(30,3, data_format="channels_last",activation='relu', padding="same")(conv15_3_2) #(12,3)
-#    conv15_3 = Conv2D(18,3, data_format="channels_last",padding="same")(conv15_3_3) #(12,3)
-#    reshaped = Reshape((jetDim,jetDim,overlapNum,parNum+1))(conv15_3)
-
-#    conv12_3_1 = Conv2D(30,3, data_format="channels_last", activation='relu', padding="same")(conv15_5)  #new
-#    conv1_3_2 = Conv2D(25,3, data_format="channels_last", activation='relu', padding="same")(conv12_3_1) #drop7lb   #new
-#    conv1_3_3 = Conv2D(20,3, data_format="channels_last", activation='relu',padding="same")(conv1_3_2) #new
-#    conv1_3_1 = Conv2D(6,3, data_format="channels_last", activation='sigmoid', padding="same")(conv1_3_3)
-#    reshaped_prob = Reshape((jetDim,jetDim,overlapNum,2))(conv1_3_1)
-#######################################################################################################################
-
- # DeepCore 2.2 Architecture
+    ##JS_EDIT set BN_actve flag to TRUE for Batch Normalization between initial layers
     conv30_9 = Conv2D(50,7, data_format="channels_last", input_shape=(jetDim,jetDim,layNum+2), activation='relu',padding="same")(ComplInput)
+    if BN_active: conv30_9 = BatchNormalization()(conv30_9)
     conv30_7 = Conv2D(40,5, data_format="channels_last", activation='relu',padding="same")(conv30_9)
-    conv30_5 = Conv2D(40,5, data_format="channels_last", activation='relu',padding="same")(conv30_7)#
-    conv20_5 = Conv2D(30,5, data_format="channels_last", activation='relu',padding="same")(conv30_5)
+    if BN_active: conv30_7 = BatchNormalization()(conv30_7)
+    #conv30_5 = Conv2D(40,5, data_format="channels_last", activation='relu',padding="same")(conv30_7)#
+    #if BN_active: conv30_5 = BatchNormalization()(conv30_5) ###JS_EDIT uncomment
+    conv20_5 = Conv2D(30,5, data_format="channels_last", activation='relu',padding="same")(conv30_7) ##JS_EDIT 30_5
+    if BN_active: conv20_5 = BatchNormalization()(conv20_5)
     conv15_5 = Conv2D(30,3, data_format="channels_last", activation='relu',padding="same")(conv20_5)
+    if BN_active: conv15_5 = BatchNormalization()(conv15_5)
 
-    conv15_3_1 = Conv2D(18,3, data_format="channels_last",activation='relu', padding="same")(conv15_5)
-    conv15_3_2 = Conv2D(18,3, data_format="channels_last",activation='relu', padding="same")(conv15_3_1)
-    conv15_3_3 = Conv2D(18,3, data_format="channels_last",activation='relu', padding="same")(conv15_3_2) #(12,3)
-    conv15_3 = Conv2D(18,3, data_format="channels_last",padding="same")(conv15_3_3) #(12,3)
+    conv15_3_1 = Conv2D(30,3, data_format="channels_last",activation='relu', padding="same")(conv15_5)
+    #conv15_3_2 = Conv2D(30,3, data_format="channels_last",activation='relu', padding="same")(conv15_3_1)
+    #conv15_3_3 = Conv2D(30,3, data_format="channels_last",activation='relu', padding="same")(conv15_3_2) #(12,3) ###JS_EDIT uncomment
+    conv15_3 = Conv2D(18,3, data_format="channels_last",padding="same")(conv15_3_1) #(12,3) ##JS_EDIT 15_3_3
     reshaped = Reshape((jetDim,jetDim,overlapNum,parNum+1))(conv15_3)
 
     conv12_3_1 = Conv2D(30,3, data_format="channels_last", activation='relu', padding="same")(conv15_5)  #new
-    conv1_3_2 = Conv2D(30,3, data_format="channels_last", activation='relu', padding="same")(conv12_3_1) #drop7lb   #new
-    conv1_3_3 = Conv2D(30,3, data_format="channels_last", activation='relu',padding="same")(conv1_3_2) #new
+    conv1_3_2 = Conv2D(25,3, data_format="channels_last", activation='relu', padding="same")(conv12_3_1) #drop7lb   #new
+    conv1_3_3 = Conv2D(20,3, data_format="channels_last", activation='relu',padding="same")(conv1_3_2) #new
     conv1_3_1 = Conv2D(6,3, data_format="channels_last", activation='sigmoid', padding="same")(conv1_3_3)
     reshaped_prob = Reshape((jetDim,jetDim,overlapNum,2))(conv1_3_1)
 #######################################################################################################################
+
     model = Model([NNinputs,NNinputs_jeta,NNinputs_jpt],[reshaped,reshaped_prob])
     
     # Made it easier to adjust learning rate
     #anubi = keras.optimizers.Adam(learning_rate=0.00001)#after epochs 252 (with septs/20 and batch_size 64)
     #Learning rate adjustments:
     # anubi = keras.optimizers.Adam(learning_rate=0.01)  #10-2
-    #anubi = keras.optimizers.Adam(learning_rate=0.001)  #10-3
-    #anubi = keras.optimizers.Adam(learning_rate=0.0001)  #10-4
-    #anubi = keras.optimizers.Adam(learning_rate=0.00001)  #10-5
-    anubi = keras.optimizers.Adam(learning_rate=0.000001)  #10-6
+    # anubi = keras.optimizers.Adam(learning_rate=0.001)  #10-3
+    anubi = keras.optimizers.Adam(learning_rate=0.0001)  #10-4 ###JS_EDIT uncomment
+    #anubi = AdamWOptimizer(learning_rate=0.001, weight_decay=0.001) ###JS_EDIT comment
+    # anubi = keras.optimizers.Adam(learning_rate=0.00001)  #10-5
+    # anubi = keras.optimizers.Adam(learning_rate=0.000001)  #10-6
     # anubi = keras.optimizers.Adam(learning_rate=0.0000001)  #10-7
     # anubi = keras.optimizers.Adam(learning_rate=0.00000001)  #10-8
     
     # Loss function adjustments:
     # ROI
-    #model.compile(optimizer=anubi, loss=[loss_mse_select_clipped,loss_ROI_crossentropy], loss_weights=[1,1]) #FOR EARLY TRAINING
+    model.compile(optimizer=anubi, loss=[loss_mse_select_clipped,loss_ROI_crossentropy], loss_weights=[1,1]) #FOR EARLY TRAINING
     # ROIsoft
-    model.compile(optimizer=anubi, loss=[loss_mse_select_clipped,loss_ROIsoft_crossentropy], loss_weights=[1,1]) #FOR LATE TRAINING
+    #model.compile(optimizer=anubi, loss=[loss_mse_select_clipped,loss_ROIsoft_crossentropy], loss_weights=[1,1]) #FOR LATE TRAINING
     
     model.summary()
 
@@ -764,6 +831,7 @@ if TRAIN or PREDICT :
 tot_events = 0
 tot_events_validation = 0
 if(LOCAL_INPUT) :
+    import uproot3
     tfile = uproot3.open(input_name)
     tree = tfile[inputModuleName][inputTreeName]
     input_jeta2 = tree.array("jet_eta")
@@ -810,7 +878,8 @@ if TRAIN :
         start_epoch = 0
     
     print("training: start")
-    
+
+    start_time = timeit.default_timer() 
     if LOCAL_INPUT :
         if DEB1EV :
             history  = model.fit([input_,input_jeta,input_jpt], [target_,target_prob],  batch_size=batch_size, epochs=epochs+start_epoch, verbose = 2,initial_epoch=start_epoch)
@@ -830,11 +899,17 @@ if TRAIN :
 
         history = model.fit(Generator2(trainingpath,batch_size),steps_per_epoch=int(stepNum/inverse_step_size),epochs=start_epoch+args.Epochs,verbose=2,max_queue_size=1,validation_data=Generator2(validationpath,batch_size),validation_steps=int(jetNum_validation/(val_inverse_step_size*batch_size)), initial_epoch=start_epoch, callbacks=[checkpointer])
         print("done running; now save")
+
+    end_time = timeit.default_timer()
         
     model.save_weights('DeepCore_train_ev{ev}_ep{ep}.h5'.format(ev=jetNum, ep=epochs+start_epoch))
     model.save('DeepCore_model_ev{ev}_ep{ep}.h5'.format(ev=jetNum, ep=epochs+start_epoch))
     
     print("training: completed")
+    ###JS_EDIT delete below if not wanted
+    print("Model saved at: ", os.getcwd())
+    print("Model name: DeepCore_model_ev{ev}_ep{ep}.h5".format(ev=jetNum, ep=epochs+start_epoch))
+    print("EXECUTION TIME: ", end_time - start_time)
 
 
     #plot of the losses ---------------
@@ -881,8 +956,8 @@ if TRAIN :
       plt.plot(arr_full[:,0], arr_full[:,1])
       plt.plot(arr_full[:,0], arr_full[:,2])
       pylab.title('Model Loss')
-      pylab.ylabel('Loss')
-      pylab.xlabel('Epoch')
+      pylab.ylabel('loss')
+      pylab.xlabel('epoch')
       plt.grid(True)
       pylab.legend(['train', 'validation'], loc='upper right')
       pdf_loss.savefig(1000, bbox_inches='tight')
@@ -891,9 +966,9 @@ if TRAIN :
       plt.yscale('log')
       plt.plot(arr_full[:,0], arr_full[:,3])
       plt.plot(arr_full[:,0], arr_full[:,4])
-      pylab.title('TP Loss')
-      pylab.ylabel('Loss')
-      pylab.xlabel('Epoch')
+      pylab.title('Model Loss (parameters)')
+      pylab.ylabel('loss')
+      pylab.xlabel('epoch')
       plt.grid(True)
       pylab.legend(['train', 'validation'], loc='upper right')
       pdf_loss.savefig(1001, bbox_inches='tight')
@@ -902,9 +977,9 @@ if TRAIN :
       plt.yscale('log')
       plt.plot(arr_full[:,0], arr_full[:,5])
       plt.plot(arr_full[:,0], arr_full[:,6])
-      pylab.title('TCP Loss')
-      pylab.ylabel('Loss')
-      pylab.xlabel('Epoch')
+      pylab.title('Model Loss (pixel maps)')
+      pylab.ylabel('loss')
+      pylab.xlabel('epoch')
       plt.grid(True)
       pylab.legend(['train', 'validation'], loc='upper right')
       pdf_loss.savefig(1002, bbox_inches='tight')
@@ -985,7 +1060,8 @@ if PREDICT :
     if not TRAIN : #must be loaded previously produced weights, otherwise if you predict on the same sample of the training not needed
         #Barrel training (used in presentation, CMSSW PR...)
         ## model.load_weights('data/DeepCore_barrel_weights.246-0.87.hdf5')
-        model.load_weights('Training_1019_9k/Deepcore_train_weights1019.h5')
+        #model.load_weights('Training_1019_9k/Deepcore_train_weights1019.h5') ##JS_EDIT uncomment
+        model.load_weights('/eos/home-j/jshteren/CMSSW_10_2_5/src/DeepCore/Condor_GPUs/DeepCore_model_ev61552.0_ep30.h5') ###JS_EDIT comment
         #EndCap training, last weights (not satisfactory, consider to restart)      
         # model.load_weights('DeepCore_ENDCAP_train_ep150.h5')
         #model.load_weights('DeepCore_train_ev{ev}_ep{ep}.h5'.format(ev=jetNum,ep=epochs+start_epoch)) 
